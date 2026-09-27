@@ -1,0 +1,4 @@
+name=
+cmdline=bootopt=64S3,32N2,64N2 cgroup.memory=nokmem sysctl.kernel.sched_pelt_multiplier=4 androidboot.serialconsole=0 cgroup_disable=memory log_buf_len=1024K
+os_version=16.0.0
+os_patch_level=2026-08

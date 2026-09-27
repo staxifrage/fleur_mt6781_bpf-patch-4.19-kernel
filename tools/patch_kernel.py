@@ -1,174 +1,300 @@
 #!/usr/bin/env python3
 """
-MTK BPF arraymap kernel patcher (UNIVAN_T790 / mt6873, 4.19.191-perf+).
+MTK BPF array-map bounds-check kernel patcher — POCO M4 Pro 4G / fleur,
+MT6781, kernel 4.19.325-cip129-st13-g4284dce0f576-dirty (raw AArch64 Image).
 
-Background
-----------
-MediaTek's downstream commit "[ALPS05247589] bpf: fix ubsan error"
-(https://gist.github.com/R0rt1z2/8af7735c6c3802148fa4da61b3cba506) added a
-bounds check to the bpf array-map lookup paths in kernel/bpf/arraymap.c:
+WHAT THIS PATCH DOES
+--------------------
+MediaTek downstream commit "bpf: fix ubsan error" (ALPS05247589,
+MTK-Commit-Id 77ac33722f4c2fbab1ec71281a1ddccb80e2b5e7) added a bogus bounds
+check to kernel/bpf/arraymap.c::array_map_update_elem():
 
     if (unlikely(sizeof(array->value) <
         array->elem_size * (index & array->index_mask)))
             return -EINVAL;
 
-Because `sizeof(array->value)` is only 28 bytes (the inline placeholder of the
-flexible-array member), every lookup whose computed slot offset reaches or
-exceeds that constant is wrongly rejected with -EINVAL. This indirectly broke
-BPF array maps and caused connectivity issues on Android 12 based ROMs.
+sizeof(array->value) is only the flexible-array placeholder size, so every
+update whose computed slot offset reaches that constant is wrongly rejected
+with -EINVAL. On this device that breaks netd's BPF map registration: Wi-Fi /
+mobile data show "connected" but no traffic routes.
 
-The fix is to revert the MTK check so the original code path runs
-unconditionally. In the compiled AArch64 Image for this device, each of the
-four affected arraymap functions contains the same two-instruction guard
-(register numbers vary between sites):
+In THIS build (verified by disassembly; see README "TARGET FOUND" section),
+Clang lowered the predicate into a stack slot at [x29,#-0x34] which is tested
+by exactly two conditional branches inside array_map_update_elem(), both
+jumping to the shared -EINVAL epilogue at 0x178524:
 
-    ldrb   w?, [x?, #0x12e]      ; load the flag byte @ struct offset 0x12e
-    tbnz   w?, #2, +8            ; if bit 2 is set, SKIP the next instruction
-    <skipped instruction>        ; adr/nop pair setting up the normal path
-    <branch target>              ; out-of-line path (kfunc registration /
-                                 ; -EINVAL style early-out blocks)
+    0x178624: a8 c3 5c b8   ldur w8, [x29, #-0x34]     ; reload MTK flag
+    0x178628: e8 f7 07 36   tbz  w8, #0, #0x178524     ; branch #1 -> -EINVAL
+    0x1786c8: a8 c3 5c b8   ldur w8, [x29, #-0x34]
+    0x1786cc: c8 f2 07 36   tbz  w8, #0, #0x178524     ; branch #2 -> -EINVAL
 
-NOPing both instructions makes the guard inert: the skipped instruction now
-always executes and the fall-through target is untouched, so the patch is
-length-preserving (no relocations, identical image size) and semantically
-equivalent to reverting the MTK hunk in every lookup/update entry point.
+The fix replaces each 4-byte `tbz` word with `nop` (d5 03 20 1f), making the
+guard inert while preserving fall-through success semantics. The patch is
+length-preserving (no relocations, identical file size): exactly 2 sites,
+exactly 4 changed bytes per site, 8 bytes total.
 
-Matching is done purely on AArch64 encodings (scaled LDRB imm12 == 0x12e
-immediately followed by TBNZ #2 with imm14 == +8 on the same Rt). This exact
-combination occurs precisely 4 times in the whole 39 MB Image - the four
-arraymap sites at file offsets 0x37a45c, 0x37b2ec, 0x37d650 and 0x37f098 -
-and nowhere else, which makes the signature safe without needing per-kernel
-offset tables.
+UNAMBIGUITY REQUIREMENTS (fail closed)
+--------------------------------------
+* Each full 8-byte signature (flag reload + branch) must occur EXACTLY ONCE
+  in the image. 0 matches or >1 matches => hard failure (exit 2/3).
+* Every matched branch word must decode as `tbz w8, #0, <epilogue>` with
+  imm14 == -32 and target -0x1a4 bytes from the branch (the shared -EINVAL
+  cleanup epilogue of this function). Any deviation => exit 4.
+* An input where the branch words are ALREADY nops but the signatures' first
+  halves still match is reported as inconsistent state => exit 5.
+* If --expect-sha256 is given, the input SHA-256 must match => exit 6.
+* Output must be byte-identical to input except exactly the expected 4-byte
+  windows; total differing bytes must equal 2 * len(--expect-changed-bytes)
+  (default 8) => exit 7 on any surprise.
+* Size must be preserved => exit 8.
 
-The tool never rewrites anything else, validates alignment/instruction
-decoding when capstone is available, and prints a per-site report.
+Exit codes
+----------
+  0 ok | 2 no target match | 3 ambiguous (>1) match | 4 instruction decode
+  5 already-patched / inconsistent state           | 6 unexpected input SHA
+  7 unexpected diff structure                      | 8 size changed
+  9 usage / IO error                               | 10 capstone verify failed
 
 Usage:
-    python3 tools/patch_kernel.py <input Image> <output Image> [--force]
+    python3 tools/patch_kernel.py <input Image> <output Image> \
+        [--report patch_report.json] [--expect-sha256 HEX] [--dry-run]
+
+A machine-readable JSON report describing the exact patch sites is written
+when --report is given (also printed to stdout summary lines prefixed [R]).
 """
 
 import argparse
+import hashlib
+import json
 import struct
 import sys
 
-# ---------------------------------------------------------------------------
-# AArch64 encodings
-# ---------------------------------------------------------------------------
 NOP_U32 = 0xD503201F
 NOP_BYTES = struct.pack("<I", NOP_U32)
 
-# ldrb w?, [x?, #imm12]  (unsigned offset, scaled by 1):  0x39400000 / mask 0xFFC00000
-LDRB_MASK = 0xFFC00000
-LDRB_BASE = 0x39400000
-OFF_CPU_SHIFTED = 0x12E >> 0  # byte offset used directly as imm12 for LDRB
+# ---------------------------------------------------------------------------
+# Verified patch signatures for the fleur MT6781 4.19.325-cip129-st13 kernel.
+# Each entry: (8-byte pattern, replacement for its LAST 4 bytes, description)
+# The 8-byte patterns were programmatically verified to be unique across the
+# whole 29,870,160-byte raw Image (see README table).
+# ---------------------------------------------------------------------------
+SITES = [
+    {
+        "pattern": bytes.fromhex("a8c35cb8e8f70736"),
+        "replace_last": bytes.fromhex("d503201f"),
+        "context_before": bytes.fromhex("a8c35cb8"),
+        "orig_disasm": "tbz w8, #0, #0x178524",
+        "new_disasm": "nop",
+        "role": "percpu memcpy tail guard",
+    },
+    {
+        "pattern": bytes.fromhex("a8c35cb8c8f20736"),
+        "replace_last": bytes.fromhex("d503201f"),
+        "context_before": bytes.fromhex("a8c35cb8"),
+        "orig_disasm": "tbz w8, #0, #0x178524",
+        "new_disasm": "nop",
+        "role": "normal-array memcpy guard",
+    },
+]
 
-# tbnz w/x?, #2, #+8  (exact encoding observed on this kernel: 0x37100148 for Rt=w8)
-#   [31] x | [30] 0 | [29] op=1 | [28:25]=1101 | [24] b5[0] | [23:19] b5[5:1]
-#   | [18:5] imm14 | [4:0] Rt
-# For bit #2 (b5=2): bit24=0, bits[23:19]=00010.
-# imm14 = +2 instructions (+8 bytes) -> imm field value 2 at bits[18:5].
-# Mask ignores the x-size bit [31] and Rt [4:0]; same-Rt pairing is checked separately.
-TBNZ2_P8_WORD = 0x37100148
-TBNZ2_P8_MASK = 0x7F1FFFFF     # keep bits [30:5], ignore x bit and Rt
-TBNZ2_P8_BASE = TBNZ2_P8_WORD & TBNZ2_P8_MASK
+EXPECTED_SITE_COUNT = len(SITES)          # 2
+EXPECTED_CHANGED_BYTES_PER_SITE = 4       # one AArch64 instruction
+EXPECTED_TOTAL_CHANGED_BYTES = EXPECTED_SITE_COUNT * EXPECTED_CHANGED_BYTES_PER_SITE  # 8
 
 
-def decode_ldrb_off_0x12e(word):
-    """Return Rt if `word` is 'ldrb w<Rt>, [x<n>, #0x12e]' else None."""
-    if (word & LDRB_MASK) != LDRB_BASE:
+def die(code, msg):
+    print(f"[!] FATAL: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def find_all(data, pat):
+    """All (non-overlapping-safe) offsets of pat in data."""
+    offs, start = [], 0
+    while True:
+        i = data.find(pat, start)
+        if i < 0:
+            return offs
+        offs.append(i)
+        start = i + 1
+
+
+def decode_tbz_w8_to_epilogue(word, branch_off):
+    """Strictly decode `tbz w8, #0, <target>`; return target offset or None.
+
+    TBZ encoding: [31]=0 [30:29]=0 [28:24]=01101 [23:19]=imm5 [18:5]=imm14 [4:0]=Rt
+    bit #0 => imm5 == 0; Rt == 8; imm14 = (target - pc)/4.
+    """
+    # Encoding fields: [31]=x, [30:29]=0, [28:24]=B54:op (TBZ => 0b101100),
+    # [23:19]=imm5, [18:5]=imm14, [4:0]=Rt.
+    # Require x==0 (W register, bit [31]) and bits [30:24] == 0b101100 (TBZ form):
+    mask = 0x7F000000
+    if (word & mask) != (0x36000000 & mask):
         return None
-    imm12 = (word >> 10) & 0xFFF
-    if imm12 != 0x12E:
+    if word & 0x80000000:                 # x bit must be 0 => W register (w8)
         return None
-    return word & 0x1F
-
-
-def decode_tbnz_bit2_plus8(word):
-    """Return Rt if `word` is 'tbnz w<x>, #2, +8' else None."""
-    if (word & TBNZ2_P8_MASK) != TBNZ2_P8_BASE:
+    imm5 = (word >> 19) & 0x1F
+    if imm5 != 0:                         # test bit #0
         return None
-    return word & 0x1F
-
-
-def find_sites(data):
-    """Yield file offsets of every MTK arraymap check site in `data`."""
-    n = len(data) - (len(data) % 4)
-    for off in range(0, n - 8, 4):
-        rt_a = decode_ldrb_off_0x12e(struct.unpack_from("<I", data, off)[0])
-        if rt_a is None:
-            continue
-        rt_b = decode_tbnz_bit2_plus8(struct.unpack_from("<I", data, off + 4)[0])
-        if rt_b is None:
-            continue
-        if rt_a == rt_b:
-            yield off
+    rt = word & 0x1F
+    if rt != 8:                           # must be w8 (this exact build)
+        return None
+    imm14 = (word >> 5) & 0x3FFF
+    if imm14 & 0x2000:                    # sign extend
+        imm14 -= 0x4000
+    return branch_off + imm14 * 4
 
 
 def verify_with_capstone(data, sites):
-    """Optional disassembly verification (no-op if capstone isn't installed)."""
+    """Optional strict disassembly verification (skip if capstone missing)."""
     try:
-        from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+        from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
     except ImportError:
         print("[*] capstone not installed - skipping disasm verification")
         return True
-    md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
     ok = True
     for s in sites:
-        seq = list(md.disasm(data[s:s + 16], s))
+        seq = list(md.disasm(bytes(data[s["off"]:s["off"] + 8]), s["off"]))
         names = [(i.mnemonic, i.op_str.strip()) for i in seq]
-        if len(seq) != 4 or names[0][0] != "ldrb" or names[1][0] != "tbnz":
-            print(f"[!] unexpected decoding at 0x{s:x}: {names}")
+        if len(seq) != 2 or names[0][0] != "ldur" or names[1][0] != "tbz":
+            print(f"[!] unexpected decoding at 0x{s['off']:x}: {names}")
             ok = False
         else:
-            print(f"    0x{s:x}: {names[0][0]} {names[0][1]} ; {names[1][0]} {names[1][1]}"
-                  f"  (skips: {names[2][0]} {names[2][1]})")
+            print(f"    0x{s['off']:x}: {names[0][0]} {names[0][1]} ; "
+                  f"{names[1][0]} {names[1][1]}")
     return ok
 
 
 def main():
-    ap = argparse.ArgumentParser(description="MTK BPF arraymap kernel patcher")
-    ap.add_argument("input", help="unpacked kernel Image (input)")
+    ap = argparse.ArgumentParser(description="MTK BPF array_map_update_elem patcher (fleur/MT6781)")
+    ap.add_argument("input", help="unpacked kernel Image (as extracted by magiskboot)")
     ap.add_argument("output", help="patched kernel Image (output)")
-    ap.add_argument("--force", action="store_true",
-                    help="apply even if the expected site count (4) is not matched")
+    ap.add_argument("--report", help="write machine-readable JSON patch report here")
+    ap.add_argument("--expect-sha256", help="fail unless the INPUT file has this SHA-256")
+    ap.add_argument("--dry-run", action="store_true", help="locate+verify only, do not write output")
     args = ap.parse_args()
 
-    with open(args.input, "rb") as f:
-        data = bytearray(f.read())
+    try:
+        with open(args.input, "rb") as f:
+            data = bytearray(f.read())
+    except OSError as e:
+        die(9, f"cannot read input: {e}")
 
     orig_len = len(data)
+    in_sha = hashlib.sha256(data).hexdigest()
     print(f"[*] Input:  {args.input} ({orig_len} bytes)")
+    print(f"[*] SHA-256: {in_sha}")
 
-    sites = list(find_sites(data))
+    if args.expect_sha256 and in_sha != args.expect_sha256.lower():
+        die(6, f"unexpected kernel SHA-256 (expected {args.expect_sha256.lower()}, got {in_sha})")
+
+    # --- locate every signature, enforce unambiguous 1:1 matching ----------
+    sites = []
+    for idx, sig in enumerate(SITES):
+        matches = find_all(bytes(data), sig["pattern"])
+        if len(matches) == 0:
+            # distinguish "already patched" from "unsupported kernel":
+            ctx = find_all(bytes(data), sig["context_before"])
+            already = [o + 4 for o in ctx
+                       if struct.unpack_from("<I", data, o + 4)[0] == NOP_U32]
+            if already:
+                die(5, f"signature #{idx} context present but branch already NOPed at "
+                       f"{[hex(a) for a in already]} - inconsistent/already-patched state")
+            die(2, f"signature #{idx} ({sig['pattern'].hex()}) found 0 times - "
+                   f"unknown BPF patch target / unsupported kernel")
+        if len(matches) > 1:
+            die(3, f"signature #{idx} ({sig['pattern'].hex()}) found {len(matches)} times "
+                   f"at {[hex(m) for m in matches]} - ambiguous patch target")
+        off = matches[0]
+        if off % 4:
+            die(4, f"signature #{idx} matched at unaligned offset 0x{off:x}")
+        # branch word is the last 4 bytes of the pattern
+        br_off = off + 4
+        word = struct.unpack_from("<I", data, br_off)[0]
+        if word == NOP_U32:
+            die(5, f"site 0x{br_off:x} already patched (branch word is nop)")
+        target = decode_tbz_w8_to_epilogue(word, br_off)
+        if target is None:
+            die(4, f"site 0x{br_off:x}: word {word:08x} does not decode as tbz w8,#0,...")
+        # Both verified branches jump to the shared -EINVAL epilogue at 0x178524
+        if target != 0x178524:
+            die(4, f"site 0x{br_off:x}: tbz target 0x{target:x} != expected -EINVAL "
+                   f"epilogue 0x178524 - refusing ambiguous/unknown target")
+        sites.append({"off": off, "branch_off": br_off, "sig_idx": idx,
+                      "before_hex": sig["pattern"].hex(),
+                      "after_hex": (sig["context_before"] + sig["replace_last"]).hex(),
+                      "orig_disasm": sig["orig_disasm"], "new_disasm": sig["new_disasm"],
+                      "role": sig["role"]})
+
+    if len(sites) != EXPECTED_SITE_COUNT:
+        die(3, f"expected exactly {EXPECTED_SITE_COUNT} sites, got {len(sites)}")
+
     print(f"[*] Found {len(sites)} MTK arraymap bounds-check site(s): "
-          + ", ".join(hex(s) for s in sites))
-
-    if not sites:
-        print("[!] No patchable sites found. Already patched, or unsupported kernel.")
-        sys.exit(2)
-    if len(sites) != 4 and not args.force:
-        print("[!] Expected exactly 4 sites on this kernel - refusing (use --force).")
-        sys.exit(3)
+          + ", ".join(hex(s["branch_off"]) for s in sites))
 
     print("[*] Site context (disassembly):")
-    if not verify_with_capstone(data, sites) and not args.force:
-        print("[!] Verification failed - refusing (use --force).")
-        sys.exit(4)
+    if not verify_with_capstone(data, sites):
+        die(10, "capstone verification failed - refusing to patch")
 
+    # --- apply ------------------------------------------------------------
+    out = bytearray(data)
     for s in sites:
-        # sanity: don't double-patch an already-NOP'd pair
-        if struct.unpack_from("<I", data, s + 4)[0] == NOP_U32:
-            print(f"[-] Site 0x{s:x} already patched, skipping")
-            continue
-        data[s:s + 4] = NOP_BYTES          # ldrb w?,[x?,#0x12e] -> nop
-        data[s + 4:s + 8] = NOP_BYTES      # tbnz w?,#2,+8       -> nop
-        print(f"[+] Patched site at file offset 0x{s:x} (2 instructions NOPed)")
+        repl = SITES[s["sig_idx"]]["replace_last"]
+        out[s["branch_off"]:s["branch_off"] + 4] = repl
+        print(f"[+] Patched branch at file offset 0x{s['branch_off']:x} "
+              f"({s['orig_disasm']} -> {s['new_disasm']})")
 
-    assert len(data) == orig_len, "image size changed!"
+    # --- post-patch structural self-verification --------------------------
+    if len(out) != orig_len:
+        die(8, "output size differs from input size")
+    diff_bytes = [i for i in range(orig_len) if out[i] != data[i]]
+    expected_diff = sorted(b for s in sites for b in range(s["branch_off"], s["branch_off"] + 4))
+    if diff_bytes != expected_diff:
+        die(7, f"unexpected diff structure: {len(diff_bytes)} bytes differ, expected "
+               f"exactly {EXPECTED_TOTAL_CHANGED_BYTES} at {[hex(e) for e in expected_diff]}")
 
-    with open(args.output, "wb") as f:
-        f.write(data)
-    print(f"[+] Wrote patched kernel -> {args.output} ({len(data)} bytes, size preserved)")
+    out_sha = hashlib.sha256(out).hexdigest()
+    report = {
+        "schema": "fleur-mt6781-bpf-patch/v1",
+        "device": "POCO M4 Pro 4G (fleur)",
+        "soc": "MT6781",
+        "kernel_version": "4.19.325-cip129-st13-g4284dce0f576-dirty",
+        "function": "array_map_update_elem (kernel/bpf/arraymap.c, MTK check ALPS05247589)",
+        "input_file": args.input,
+        "input_size": orig_len,
+        "input_sha256": in_sha,
+        "output_file": args.output,
+        "output_sha256": out_sha,
+        "sites": [{
+            "offset": hex(s["branch_off"]),
+            "original_bytes": s["before_hex"][8:],
+            "replacement_bytes": SITES[s["sig_idx"]]["replace_last"].hex(),
+            "original_instruction": s["orig_disasm"],
+            "replacement_instruction": s["new_disasm"],
+            "context_pattern": s["before_hex"],
+            "changed_bytes": EXPECTED_CHANGED_BYTES_PER_SITE,
+            "role": s["role"],
+        } for s in sites],
+        "total_changed_bytes": len(diff_bytes),
+        "size_preserved": True,
+        "hardware_tested": False,
+    }
+    if args.report:
+        with open(args.report, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"[+] Wrote patch report -> {args.report}")
+
+    if args.dry_run:
+        print("[*] Dry run: no output written")
+        return
+
+    try:
+        with open(args.output, "wb") as f:
+            f.write(out)
+    except OSError as e:
+        die(9, f"cannot write output: {e}")
+    print(f"[+] Wrote patched kernel -> {args.output} ({len(out)} bytes, size preserved)")
+    print(f"[+] Patched kernel SHA-256: {out_sha}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,378 @@
+name: Build patched fleur boot image
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish a GitHub prerelease after validation"
+        type: boolean
+        required: true
+        default: false
+
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-patched-boot.yml"
+      - "tools/**"
+      - "ci/**"
+      - "boot_a-current.img"
+      - "dump/kernel"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Patch and repack boot_a
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install capstone
+
+      - name: Load pinned Magisk configuration
+        run: |
+          set -euo pipefail
+
+          cat ci/magiskboot.env >> "$GITHUB_ENV"
+
+      - name: Verify canonical source boot image
+        run: |
+          set -euo pipefail
+
+          sha256sum boot_a-current.img
+          sha256sum -c ci/boot_a-current.img.sha256
+
+          test "$(stat -c '%s' boot_a-current.img)" -eq 67108864
+
+      - name: Download pinned official Magisk APK
+        run: |
+          set -euo pipefail
+
+          mkdir -p .ci-tools
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            "$MAGISK_APK_URL" \
+            --output .ci-tools/magisk.apk
+
+          echo "$MAGISK_APK_SHA256  .ci-tools/magisk.apk" \
+            | sha256sum -c -
+
+      - name: Extract and verify magiskboot
+        run: |
+          set -euo pipefail
+
+          unzip -p \
+            .ci-tools/magisk.apk \
+            "$MAGISKBOOT_ENTRY" \
+            > .ci-tools/magiskboot
+
+          chmod +x .ci-tools/magiskboot
+
+          echo "$MAGISKBOOT_SHA256  .ci-tools/magiskboot" \
+            | sha256sum -c -
+
+          file .ci-tools/magiskboot
+
+      - name: Prepare workspace
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            work/original \
+            work/verify \
+            output
+
+          cp boot_a-current.img \
+            work/original/boot_a-current.img
+
+      - name: Unpack original boot image
+        working-directory: work/original
+        run: |
+          set -euo pipefail
+
+          ../../.ci-tools/magiskboot \
+            unpack \
+            -h \
+            boot_a-current.img
+
+          test -f kernel
+
+          echo "Extracted files:"
+          find . -maxdepth 1 -type f \
+            -printf '%f %s bytes\n' \
+            | sort
+
+      - name: Verify extracted kernel against repository dump
+        run: |
+          set -euo pipefail
+
+          cmp \
+            --silent \
+            work/original/kernel \
+            dump/kernel
+
+          echo "magiskboot-extracted kernel matches dump/kernel"
+
+          sha256sum \
+            work/original/kernel \
+            dump/kernel
+
+          cp \
+            work/original/kernel \
+            work/original/kernel.original
+
+      - name: Patch kernel
+        run: |
+          set -euo pipefail
+
+          ORIGINAL_KERNEL_SHA="$(
+            sha256sum work/original/kernel.original \
+              | awk '{print $1}'
+          )"
+
+          python tools/patch_kernel.py \
+            work/original/kernel.original \
+            work/original/kernel.patched \
+            --expect-sha256 "$ORIGINAL_KERNEL_SHA" \
+            --report output/patch_report.json
+
+      - name: Independently verify kernel patch
+        run: |
+          set -euo pipefail
+
+          python tools/verify_kernel_patch.py \
+            work/original/kernel.original \
+            work/original/kernel.patched \
+            --report output/kernel_verification.json \
+            --expect-changed-bytes 8
+
+      - name: Install patched kernel into unpacked image
+        run: |
+          set -euo pipefail
+
+          cp \
+            work/original/kernel.patched \
+            work/original/kernel
+
+          cmp \
+            --silent \
+            work/original/kernel \
+            work/original/kernel.patched
+
+      - name: Record original unpacked component hashes
+        working-directory: work/original
+        run: |
+          set -euo pipefail
+
+          for f in \
+            ramdisk.cpio \
+            dtb \
+            kernel_dtb \
+            second \
+            extra \
+            recovery_dtbo
+          do
+            if [[ -f "$f" ]]; then
+              sha256sum "$f" \
+                >> ../../output/original-components.sha256
+            fi
+          done
+
+          cat ../../output/original-components.sha256 || true
+
+      - name: Repack boot image
+        working-directory: work/original
+        run: |
+          set -euo pipefail
+
+          ../../.ci-tools/magiskboot \
+            repack \
+            boot_a-current.img \
+            ../../output/boot_a-bpf-patched.img
+
+          test -s ../../output/boot_a-bpf-patched.img
+
+          stat \
+            --printf='patched boot size: %s bytes\n' \
+            ../../output/boot_a-bpf-patched.img
+
+      - name: Verify patched image fits boot partition
+        run: |
+          set -euo pipefail
+
+          ORIGINAL_SIZE="$(
+            stat -c '%s' boot_a-current.img
+          )"
+
+          PATCHED_SIZE="$(
+            stat -c '%s' output/boot_a-bpf-patched.img
+          )"
+
+          if (( PATCHED_SIZE > ORIGINAL_SIZE )); then
+            echo "::error::Patched image is larger than the original 64 MiB boot partition dump."
+            exit 1
+          fi
+
+      - name: Unpack generated boot image again
+        working-directory: work/verify
+        run: |
+          set -euo pipefail
+
+          cp \
+            ../../output/boot_a-bpf-patched.img \
+            patched.img
+
+          ../../.ci-tools/magiskboot \
+            unpack \
+            -h \
+            patched.img
+
+          test -f kernel
+
+      - name: Verify patched kernel survived repack exactly
+        run: |
+          set -euo pipefail
+
+          cmp \
+            --silent \
+            work/original/kernel.patched \
+            work/verify/kernel
+
+          echo "Repacked image contains the exact patched kernel."
+
+          sha256sum \
+            work/original/kernel.patched \
+            work/verify/kernel
+
+      - name: Verify unchanged boot components
+        run: |
+          set -euo pipefail
+
+          for f in \
+            ramdisk.cpio \
+            dtb \
+            kernel_dtb \
+            second \
+            extra \
+            recovery_dtbo
+          do
+            if [[ -f "work/original/$f" ]]; then
+
+              if [[ ! -f "work/verify/$f" ]]; then
+                echo "::error::$f disappeared after repack"
+                exit 1
+              fi
+
+              cmp \
+                --silent \
+                "work/original/$f" \
+                "work/verify/$f" \
+                || {
+                  echo "::error::$f changed unexpectedly"
+                  exit 1
+                }
+
+              echo "$f unchanged"
+            fi
+          done
+
+      - name: Generate SHA-256 manifest
+        run: |
+          set -euo pipefail
+
+          {
+            sha256sum boot_a-current.img
+            sha256sum work/original/kernel.original
+            sha256sum work/original/kernel.patched
+            sha256sum output/boot_a-bpf-patched.img
+          } > output/SHA256SUMS.txt
+
+          cat output/SHA256SUMS.txt
+
+      - name: Copy patched kernel to output
+        run: |
+          set -euo pipefail
+
+          cp \
+            work/original/kernel.patched \
+            output/kernel-bpf-patched
+
+      - name: Upload validated build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleur-mt6781-bpf-patched-boot
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            output/boot_a-bpf-patched.img
+            output/kernel-bpf-patched
+            output/patch_report.json
+            output/kernel_verification.json
+            output/SHA256SUMS.txt
+
+      - name: Prepare release tag
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        run: |
+          set -euo pipefail
+
+          TAG="bpf-test-${GITHUB_RUN_NUMBER}-${GITHUB_SHA::7}"
+
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub prerelease
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh release create \
+            "$RELEASE_TAG" \
+            output/boot_a-bpf-patched.img \
+            output/kernel-bpf-patched \
+            output/patch_report.json \
+            output/kernel_verification.json \
+            output/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "fleur MT6781 BPF patch test ${GITHUB_RUN_NUMBER}" \
+            --prerelease \
+            --notes "Automated test build.
+
+          Device: POCO M4 Pro 4G (fleur)
+          SoC: MT6781
+          Kernel: 4.19.325-cip129-st13-g4284dce0f576-dirty
+          Commit: ${GITHUB_SHA}
+
+          The workflow:
+          - verified the original boot image checksum
+          - unpacked it with pinned official MagiskBoot
+          - patched the extracted kernel
+          - independently verified exactly 8 changed kernel bytes
+          - repacked from the original boot image
+          - unpacked the result again
+          - verified the patched kernel survived exactly
+          - verified unchanged boot components
+
+          Hardware tested: NO
+
+          Treat this as an experimental prerelease until physical-device testing succeeds."

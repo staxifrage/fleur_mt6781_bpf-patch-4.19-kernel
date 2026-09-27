@@ -1,0 +1,37 @@
+{
+  "schema": "fleur-mt6781-bpf-patch/v1",
+  "device": "POCO M4 Pro 4G (fleur)",
+  "soc": "MT6781",
+  "kernel_version": "4.19.325-cip129-st13-g4284dce0f576-dirty",
+  "function": "array_map_update_elem (kernel/bpf/arraymap.c, MTK check ALPS05247589)",
+  "input_file": "work/original/kernel.original",
+  "input_size": 29870160,
+  "input_sha256": "8e69dd6c28aa0b8ea9143bc3b01d6e234cc01016963c4dd7889199088450db1f",
+  "output_file": "work/original/kernel.patched",
+  "output_sha256": "9e52f4aa71b19a994215cfbaedc0ea12fa7dd695e0b41698a28bf03452f715bd",
+  "sites": [
+    {
+      "offset": "0x178628",
+      "original_bytes": "e8f70736",
+      "replacement_bytes": "d503201f",
+      "original_instruction": "tbz w8, #0, #0x178524",
+      "replacement_instruction": "nop",
+      "context_pattern": "a8c35cb8e8f70736",
+      "changed_bytes": 4,
+      "role": "percpu memcpy tail guard"
+    },
+    {
+      "offset": "0x1786cc",
+      "original_bytes": "c8f20736",
+      "replacement_bytes": "d503201f",
+      "original_instruction": "tbz w8, #0, #0x178524",
+      "replacement_instruction": "nop",
+      "context_pattern": "a8c35cb8c8f20736",
+      "changed_bytes": 4,
+      "role": "normal-array memcpy guard"
+    }
+  ],
+  "total_changed_bytes": 8,
+  "size_preserved": true,
+  "hardware_tested": false
+}
