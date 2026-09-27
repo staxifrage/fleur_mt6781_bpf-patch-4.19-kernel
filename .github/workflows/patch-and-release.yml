@@ -1,0 +1,152 @@
+name: Patch boot images and publish release
+
+# This workflow:
+#   1. Downloads a pinned `magiskboot` binary (from the official Magisk releases).
+#   2. For each slot image (boot_a-current.img, boot_b-current.img):
+#        magiskboot unpack -> tools/patch_kernel.py (BPF/ubsan arraymap NOP-out)
+#        -> magiskboot repack -> structural verification (tools/magisk_repack.py)
+#      Verification refuses to emit an output image if anything outside the
+#      kernel payload changed, so a corrupt build can never be published.
+#   3. Uploads the verified boot_a-patched.img / boot_b-patched.img plus a
+#      checksums file as assets of a GitHub Release.
+#
+# Triggering: push a tag matching v* (recommended), or run manually via
+# workflow_dispatch (which publishes a dev/snapshot release).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for the snapshot release (e.g. 1.0.0-dev.1)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write # required to create releases and upload assets
+
+env:
+  # Pinned Magisk release that provides magiskboot. Change deliberately and
+  # re-test; do NOT float this to "latest" for flashable-image builds.
+  MAGISK_VERSION: "28.1"
+  MAGISK_BOOT_LOADER_URL: "https://github.com/topjohnwu/Magisk/releases/download/"
+
+jobs:
+  patch-boot-images:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install capstone (optional disasm verification in patch_kernel.py)
+        run: pip install capstone
+
+      - name: Download pinned magiskboot
+        run: |
+          set -euo pipefail
+          # magiskboot ships inside the "binaries.zip" attached to each Magisk
+          # release (same zip the Magisk app extracts on-device).
+          curl -fsSL -o binaries.zip \
+            "${MAGISK_BOOT_LOADER_URL}v${MAGISK_VERSION}/binaries.zip"
+          unzip -o binaries.zip -d magisk-bin
+          # Pick the arm64 magiskboot for patching arm64 kernels is WRONG here:
+          # we run ON x86_64 runners, so we need the x64 host binary.
+          if [ -f magisk-bin/magiskboot.x64 ]; then
+            mv magisk-bin/magiskboot.x64 magisk-bin/magiskboot
+          fi
+          chmod +x magisk-bin/magiskboot
+          ./magisk-bin/magiskboot || true # print version banner into logs
+
+      - name: Verify input images are intact ANDROID! boot images
+        run: |
+          set -euo pipefail
+          for img in boot_a-current.img boot_b-current.img; do
+            test -f "$img"
+            head -c 8 "$img" | grep -q "ANDROID!" || { echo "$img: bad magic"; exit 1; }
+            echo "  $img sha256=$(sha256sum "$img" | cut -d' ' -f1)"
+          done
+
+      - name: Patch + repack boot_a (unpack -> BPF ubsan patch -> repack -> verify)
+        run: |
+          set -euo pipefail
+          python3 tools/magisk_repack.py \
+            --boot-image boot_a-current.img \
+            --workdir build/work_a \
+            --output build/out/boot_a-patched.img \
+            --magiskboot "$GITHUB_WORKSPACE/magisk-bin/magiskboot" \
+            --patch-cmd 'python3 tools/patch_kernel.py {kernel_in} {kernel_out}'
+
+      - name: Patch + repack boot_b
+        run: |
+          set -euo pipefail
+          python3 tools/magisk_repack.py \
+            --boot-image boot_b-current.img \
+            --workdir build/work_b \
+            --output build/out/boot_b-patched.img \
+            --magiskboot "$GITHUB_WORKSPACE/magisk-bin/magiskboot" \
+            --patch-cmd 'python3 tools/patch_kernel.py {kernel_in} {kernel_out}'
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd build/out
+          sha256sum boot_a-patched.img boot_b-patched.img > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Compute release version/tag
+        id: rel
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            V="${{ github.event.inputs.version }}"
+            [ -n "$V" ] || V="0.0.0-dev.$(date +%Y%m%d%H%M%S)"
+            echo "tag=snapshot-$V" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release and upload patched images
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: "MTK BPF arraymap patched boot images (${{ steps.rel.outputs.tag }})"
+          prerelease: ${{ steps.rel.outputs.prerelease }}
+          body: |
+            Patched boot images for the MediaTek BPF `arraymap` / ubsan netd bug.
+
+            Built by `.github/workflows/patch-and-release.yml`:
+            * `magiskboot unpack` → `tools/patch_kernel.py` (length-preserving
+              NOP-out of the MTK bounds check) → `magiskboot repack`
+            * Every image passed structural verification (only the kernel
+              payload differs from the stock dump; header/dtb/ramdisk bytes
+              are identical) before being uploaded.
+
+            **Flash at your own risk.** These images are built from the dumps
+            in this repo (`boot_a-current.img` / `boot_b-current.img`). If
+            your device's boot slots differ from these dumps, do NOT flash —
+            mismatched boot images can hard-brick or fail dm-verity.
+
+            ```
+            fastboot flash boot_a boot_a-patched.img
+            fastboot flash boot_b boot_b-patched.img
+            ```
+          files: |
+            build/out/boot_a-patched.img
+            build/out/boot_b-patched.img
+            build/out/SHA256SUMS.txt
+
+      - name: Also keep artifacts for download from the workflow run itself
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-boot-images
+          path: build/out/
+          retention-days: 30
