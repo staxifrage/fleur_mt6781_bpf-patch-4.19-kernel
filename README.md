@@ -14,7 +14,83 @@ MediaTek introduced a proprietary commit into their `4.14` and `4.19` kernels to
 
 ## AI evaluation and solution solving
 
-### Update — 2026-09-27: patch-target search status (NOT FOUND — no blind patching)
+### Update — 2026-09-27 (later): TARGET FOUND — `array_map_update_elem()` located at `dump/kernel` offset `0x178080`
+
+The previous "NOT FOUND" status below was produced while searching the wrong semantic site. The
+correct target, per MediaTek commit `ALPS05247589` ("bpf: fix ubsan error", James Hsu,
+MTK-Commit-Id `77ac33722f4c2fbab1ec71281a1ddccb80e2b5e7`), is **not** the `BPF_MAP_LOOKUP_ELEM`
+size check in `kernel/bpf/syscall.c` — it is the vendor-added bounds check inside
+`kernel/bpf/arraymap.c::array_map_update_elem()`:
+
+```c
+else {
+        if (unlikely(sizeof(array->value) <
+            array->elem_size * (index & array->index_mask)))
+                return -EINVAL;
+        memcpy(array->value + array->elem_size * (index & array->index_mask),
+               value, map->value_size);
+}
+```
+
+#### Identification of the function (`0x178080`)
+
+`array_map_update_elem()` was positively identified by its full control/data flow, not by generic
+byte patterns:
+
+* prologue at `0x178080`, stack canary loaded from `__stack_chk_guard` (`0x18d6d18`);
+* shared `-EINVAL` error epilogue at `0x1780d8`: `mov w22, #-0x16` → common return path
+  (`mov w0, w22` / canary check / `ret` at `0x1780f0–0x178110`) — note the compiler materializes
+  `-EINVAL` **once**, in a register-preserved epilogue, which is why requiring an adjacent
+  `mov w0, #-0x16` is the wrong filter;
+* flags validation via `ldr x23,[x1,#0x28]` + `tst x23,#-5` → `b.ne` to the `-EINVAL` epilogue
+  (`0x1780b0–0x1780b4`); `BPF_NOEXIST` test via `ldr w9,[x0,#0x2c]` + `tbnz w9,#0x1f` (`0x1780cc`);
+* percpu vs normal-array dispatch via `tbz/tbnz #0x1f` on the map-type word at `[map,#0x2c]`;
+* the normal-array store is `bl #0xcb40` (kernel `memcpy`) with size taken from
+  `ldr w8,[x19,#0x20]` = `map->value_size` (e.g. `0x1786a8–0x1786b8` and `0x178708–0x178718`);
+* the percpu element-copy loop also ends in `bl #0xcb40` (`0x178540–0x178554`), followed by the
+  MTK-check flag reload.
+
+#### The MediaTek check as compiled here
+
+Clang lowered the bogus comparison into a predicate stored on the stack at `[x29,#-0x34]`, tested
+by **two conditional branches** that both jump to the error-cleanup epilogue at `0x178524` (which
+restores state and returns `w22`, i.e. `-EINVAL`):
+
+```text
+0x178624: a8 c3 5c b8   ldur w8, [x29, #-0x34]     ; reload MTK-check result flag
+0x178628: e8 f7 07 36   tbz  w8, #0, #0x178524     ; <-- MTK branch #1 -> -EINVAL
+
+0x1786c8: a8 c3 5c b8   ldur w8, [x29, #-0x34]
+0x1786cc: c8 f2 07 36   tbz  w8, #0, #0x178524     ; <-- MTK branch #2 -> -EINVAL
+```
+
+Branch #1 sits immediately after the percpu `memcpy` tail; branch #2 sits immediately after the
+normal-array `memcpy(array->value + elem_size*(index & index_mask), value, map->value_size)` at
+`0x1786b8`. Falling through either branch continues into the normal success path
+(`0x17862c` / `0x1786d0 → 0x17862c`), so neutralizing only these two branches preserves all
+legitimate update semantics — exactly the intended `mtk-bpf-patcher` transformation (reference
+build used `cbnz w8` → `nop`; this build uses `tbz` because the predicate lives in a stack slot).
+
+#### Patch (validated signatures, unique across the whole image)
+
+Replace each 4-byte branch word with `d5 03 20 1f` (`nop`). Uniqueness verified over all of
+`dump/kernel` using the full 8-byte sequences including the preceding flag reload:
+
+| file offset | BEFORE (pattern)             | instruction              | AFTER (replace)          |
+|-------------|------------------------------|--------------------------|--------------------------|
+| `0x178624`  | `a8c35cb8 e8f70736`          | `ldur w8,[x29,#-0x34]` + `tbz w8,#0,#0x178524` | `a8c35cb8 d503201f` |
+| `0x1786c8`  | `a8c35cb8 c8f20736`          | `ldur w8,[x29,#-0x34]` + `tbz w8,#0,#0x178524` | `a8c35cb8 d503201f` |
+
+Each combined pattern has exactly **one** match in the image (checked programmatically). No patch
+has been applied to `dump/kernel` yet (current reference checksum:
+`8e69dd6c28aa0b8ea9143bc3b01d6e234cc01016963c4dd7889199088450db1f`; note this differs from the
+older `3c70a867…` value quoted above — the dump was re-unpacked since that entry was written, and
+the offsets/signatures in this section were verified against the current file); recommended application via
+`python tools/patch_kernel.py dump/kernel --offset 0x178628 --pattern a8c35cb8e8f70736 --replace-hex a8c35cb8d503201f`
+(and likewise for `0x1786cc`), followed by runtime confirmation that `update_elem` on a small-index
+array map returns success post-patch where it previously failed, breaking netd's map registration.
+
+### Update — 2026-09-27: patch-target search status (NOT FOUND — no blind patching) *(superseded by the entry above)*
 
 We ran an automated, disassembly-based search for the exact BPF `BPF_MAP_LOOKUP_ELEM` size-check site
 (`tools/patch_kernel.py` target pattern) inside the dumped kernel. Status of this iteration:
